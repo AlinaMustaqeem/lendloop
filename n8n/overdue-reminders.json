@@ -1,0 +1,442 @@
+{
+  "id": "LendLoopOverdue1",
+  "name": "LendLoop - Daily overdue reminders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "daily-schedule",
+      "name": "Daily at 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1100,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "manual-run",
+      "name": "Run now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst today = new Date().toISOString().slice(0, 10);\nconst timestamp = String(Date.now());\nconst path = `/api/n8n/overdue?date=${today}`;\n// Unique per run; HTTP retries reuse it, and Convex claims it only after a successful read.\nconst eventId = `overdue-fetch:${today}:${crypto.randomUUID()}`;\nconst signature = crypto.createHmac('sha256', $env.N8N_SHARED_SECRET).update(`${timestamp}.GET.${path}.`).digest('hex');\nreturn [{ json: { today, path, url: `${$env.CONVEX_HTTP_URL}${path}`, timestamp, eventId, signature } }];"
+      },
+      "id": "sign-overdue-fetch",
+      "name": "Sign overdue request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-lendloop-timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "x-lendloop-event-id",
+              "value": "={{ $json.eventId }}"
+            },
+            {
+              "name": "x-lendloop-signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": false,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "fetch-overdue-loans",
+      "name": "Fetch overdue loans",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -660,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst hmac = (message) => crypto.createHmac('sha256', $env.N8N_SHARED_SECRET).update(message).digest('hex');\nconst safeEqual = (signature, expected) => {\n  if (!/^[a-f0-9]{64}$/i.test(String(signature))) return false;\n  return crypto.timingSafeEqual(Buffer.from(String(signature), 'hex'), Buffer.from(expected, 'hex'));\n};\n\n// $json is the full HTTP response; with the \"text\" response format n8n keeps the raw body in `data`.\nconst signed = $('Sign overdue request').first().json;\nconst headers = $json.headers || {};\nif (String(headers['x-lendloop-timestamp'] || '') !== signed.timestamp) throw new Error('Convex response timestamp mismatch');\nif (typeof $json.data !== 'string') throw new Error('Expected the raw Convex response body as text');\nconst rawBody = $json.data;\nconst expected = hmac(`${signed.timestamp}.${$json.statusCode}.${signed.path}.${rawBody}`);\nif (!safeEqual(headers['x-lendloop-signature'], expected)) throw new Error('Invalid Convex response signature');\n\nconst { items } = JSON.parse(rawBody);\nif (!Array.isArray(items)) throw new Error('Convex response has no items array');\nreturn [{ json: { items } }];"
+      },
+      "id": "verify-overdue-response",
+      "name": "Verify Convex response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "items",
+        "options": {}
+      },
+      "id": "split-overdue-items",
+      "name": "One item per borrower",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        -220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Runs once per overdue loan, so every borrower gets their own reminder.\nconst e = $json;\nreturn { json: { ...e, mail: {\n  From: { Email: 'reminders@lendloop.local', Name: 'LendLoop' },\n  To: [{ Email: e.recipientEmail, Name: e.recipientName }],\n  Subject: `Reminder: ${e.toolName} is overdue`,\n  Text: `Hi ${e.recipientName}, ${e.toolName} was due back on ${e.dueDate}. Please arrange its return with your neighbor.`,\n} } };"
+      },
+      "id": "prepare-reminder",
+      "name": "Prepare reminder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mailpit:8025/api/v1/send",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.mail) }}",
+        "options": {}
+      },
+      "id": "send-reminder-mail",
+      "name": "Send reminder to Mailpit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        220,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const { mail, ...reminder } = $('Prepare reminder').item.json;\nreturn { json: { ...reminder, status: 'sent' } };"
+      },
+      "id": "mark-sent",
+      "name": "Reminder sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Error branch of the send step: the failure is written back to Convex instead of being dropped.\nconst { mail, ...reminder } = $('Prepare reminder').item.json;\nconst error = String($json.error?.message || $json.error || 'Reminder delivery failed').slice(0, 300);\nreturn { json: { ...reminder, status: 'failed', error } };"
+      },
+      "id": "mark-failed",
+      "name": "Reminder failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const crypto = require('crypto');\nconst reminderDate = new Date().toISOString().slice(0, 10);\nconst payload = { idempotencyKey: $json.idempotencyKey, loanId: $json.loanId, reminderDate, status: $json.status };\nif ($json.error) payload.error = $json.error;\nconst body = JSON.stringify(payload);\nconst timestamp = String(Date.now());\nconst path = '/api/n8n/reminders';\n// New ID per write-back; HTTP retries reuse it so Convex acknowledges them as duplicates.\n// The reminder itself is upserted on idempotencyKey (loan + date), so reruns never duplicate it.\nconst eventId = `${$json.idempotencyKey}:${$json.status}:${crypto.randomUUID()}`;\nconst signature = crypto.createHmac('sha256', $env.N8N_SHARED_SECRET).update(`${timestamp}.POST.${path}.${body}`).digest('hex');\nreturn { json: { url: `${$env.CONVEX_HTTP_URL}${path}`, path, timestamp, eventId, signature, body, loanId: $json.loanId, status: $json.status } };"
+      },
+      "id": "sign-writeback",
+      "name": "Sign reminder write-back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-lendloop-timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "x-lendloop-event-id",
+              "value": "={{ $json.eventId }}"
+            },
+            {
+              "name": "x-lendloop-signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": false,
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "id": "record-reminder",
+      "name": "Record reminder idempotently",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        880,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const crypto = require('crypto');\nconst hmac = (message) => crypto.createHmac('sha256', $env.N8N_SHARED_SECRET).update(message).digest('hex');\nconst safeEqual = (signature, expected) => {\n  if (!/^[a-f0-9]{64}$/i.test(String(signature))) return false;\n  return crypto.timingSafeEqual(Buffer.from(String(signature), 'hex'), Buffer.from(expected, 'hex'));\n};\n\n// $json is the full HTTP response; with the \"text\" response format n8n keeps the raw body in `data`.\nconst signed = $('Sign reminder write-back').item.json;\nconst headers = $json.headers || {};\nif (String(headers['x-lendloop-timestamp'] || '') !== signed.timestamp) throw new Error('Convex response timestamp mismatch');\nif (typeof $json.data !== 'string') throw new Error('Expected the raw Convex response body as text');\nconst rawBody = $json.data;\nconst expected = hmac(`${signed.timestamp}.${$json.statusCode}.${signed.path}.${rawBody}`);\nif (!safeEqual(headers['x-lendloop-signature'], expected)) throw new Error('Invalid Convex response signature');\n\nreturn { json: { loanId: signed.loanId, status: signed.status, acknowledgement: JSON.parse(rawBody) } };"
+      },
+      "id": "verify-writeback-response",
+      "name": "Verify write-back acknowledgement",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Every write-back has completed by now. If any send failed, fail this execution so the\n// error workflow alerts an operator; the failed reminders are retried on the next run.\nconst failed = $input.all().filter((item) => item.json.status === 'failed');\nif (failed.length) {\n  throw new Error(`${failed.length} overdue reminder(s) failed to send and were recorded as failed in Convex`);\n}\nreturn $input.all();"
+      },
+      "id": "surface-failures",
+      "name": "Surface failed reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Daily at 08:00": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign overdue request": {
+      "main": [
+        [
+          {
+            "node": "Fetch overdue loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch overdue loans": {
+      "main": [
+        [
+          {
+            "node": "Verify Convex response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Convex response": {
+      "main": [
+        [
+          {
+            "node": "One item per borrower",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per borrower": {
+      "main": [
+        [
+          {
+            "node": "Prepare reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare reminder": {
+      "main": [
+        [
+          {
+            "node": "Send reminder to Mailpit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reminder to Mailpit": {
+      "main": [
+        [
+          {
+            "node": "Reminder sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reminder failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reminder sent": {
+      "main": [
+        [
+          {
+            "node": "Sign reminder write-back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reminder failed": {
+      "main": [
+        [
+          {
+            "node": "Sign reminder write-back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign reminder write-back": {
+      "main": [
+        [
+          {
+            "node": "Record reminder idempotently",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record reminder idempotently": {
+      "main": [
+        [
+          {
+            "node": "Verify write-back acknowledgement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify write-back acknowledgement": {
+      "main": [
+        [
+          {
+            "node": "Surface failed reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "errorWorkflow": "LendLoopErrHndlr"
+  },
+  "versionId": "22222222-2222-4222-8222-222222222222",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

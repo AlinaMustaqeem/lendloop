@@ -1,0 +1,88 @@
+{
+  "id": "LendLoopErrHndlr",
+  "name": "LendLoop - Automation error handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep only metadata: no message bodies, recipients or secrets leave this node.\nconst e = $input.first().json;\nconst safe = {\n  at: new Date().toISOString(),\n  workflow: e.workflow?.name || 'unknown',\n  executionId: e.execution?.id || 'unknown',\n  executionUrl: e.execution?.url || null,\n  lastNode: e.execution?.lastNodeExecuted || e.trigger?.error?.node?.name || 'unknown',\n  message: String(e.execution?.error?.message || e.trigger?.error?.message || 'Unknown workflow error').slice(0, 500),\n};\nconsole.error('[LendLoop automation failure]', JSON.stringify(safe));\nconst to = $env.OPS_ALERT_EMAIL || 'ops@lendloop.local';\nreturn [{ json: { ...safe, mail: {\n  From: { Email: 'alerts@lendloop.local', Name: 'LendLoop automations' },\n  To: [{ Email: to }],\n  Subject: `[LendLoop] ${safe.workflow} failed at \"${safe.lastNode}\"`,\n  Text: [\n    `Workflow: ${safe.workflow}`,\n    `Failed node: ${safe.lastNode}`,\n    `Error: ${safe.message}`,\n    `Execution: ${safe.executionUrl || safe.executionId}`,\n    `Time: ${safe.at}`,\n  ].join('\\n'),\n} } }];"
+      },
+      "id": "build-alert",
+      "name": "Build sanitized alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mailpit:8025/api/v1/send",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.mail) }}",
+        "options": {}
+      },
+      "id": "email-operator",
+      "name": "Email operator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        220,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    }
+  ],
+  "connections": {
+    "Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Build sanitized alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build sanitized alert": {
+      "main": [
+        [
+          {
+            "node": "Email operator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "versionId": "33333333-3333-4333-8333-333333333333",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

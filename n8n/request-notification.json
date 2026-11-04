@@ -1,0 +1,264 @@
+{
+  "id": "LendLoopRequests",
+  "name": "LendLoop - Request notifications",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lendloop-request-events",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "webhook-request-event",
+      "name": "Request Event Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -900,
+        20
+      ],
+      "webhookId": "lendloop-request-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst hmac = (message) => crypto.createHmac('sha256', $env.N8N_SHARED_SECRET).update(message).digest('hex');\nconst safeEqual = (signature, expected) => {\n  if (!/^[a-f0-9]{64}$/i.test(String(signature))) return false;\n  return crypto.timingSafeEqual(Buffer.from(String(signature), 'hex'), Buffer.from(expected, 'hex'));\n};\n\nconst input = $input.first();\nconst headers = input.json.headers || {};\nconst timestamp = String(headers['x-lendloop-timestamp'] || '');\nconst signature = String(headers['x-lendloop-signature'] || '');\nconst eventId = String(headers['x-lendloop-event-id'] || '');\nif (!timestamp || !signature || !eventId) throw new Error('Missing LendLoop signature headers');\nif (!Number.isFinite(Number(timestamp)) || Math.abs(Date.now() - Number(timestamp)) > 5 * 60 * 1000) {\n  throw new Error('Stale or invalid webhook timestamp');\n}\n\n// Verify the exact bytes Convex signed (the webhook's \"Raw body\" option), never a re-serialised copy.\nif (!input.binary?.data) throw new Error('Raw request body is unavailable');\nconst rawBody = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('utf8');\nif (!safeEqual(signature, hmac(`${timestamp}.POST./webhook/lendloop-request-events.${rawBody}`))) {\n  throw new Error('Invalid webhook signature');\n}\nconst event = JSON.parse(rawBody);\nif (event.eventId !== eventId) throw new Error('Event ID header does not match the signed body');\n\n// Replay protection: event IDs are remembered for longer than the timestamp window.\n// Production executions persist workflow static data; an ID is stored only after its\n// notification was sent, so a Convex retry after a failed send is still processed.\nconst store = $getWorkflowStaticData('global');\nstore.deliveredEventIds = store.deliveredEventIds || {};\nconst cutoff = Date.now() - 15 * 60 * 1000;\nfor (const [id, seenAt] of Object.entries(store.deliveredEventIds)) {\n  if (seenAt < cutoff) delete store.deliveredEventIds[id];\n}\nconst duplicate = Boolean(store.deliveredEventIds[eventId]);\nreturn [{ json: { event, eventId, timestamp, duplicate } }];"
+      },
+      "id": "verify-request-hmac",
+      "name": "Verify signature and replay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -660,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "is-duplicate",
+              "leftValue": "={{ $json.duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "already-delivered",
+      "name": "Already delivered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -430,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only the minimal fields Convex sent are used: recipient, display names, tool, dates, status.\nconst e = $json.event;\nconst subjects = {\n  'request.created': `New request for ${e.toolName}`,\n  'request.approved': `Your ${e.toolName} request was approved`,\n  'request.declined': `Update on your ${e.toolName} request`,\n  'request.cancelled': `Cancelled request for ${e.toolName}`,\n};\nconst statusLine = e.message || (e.status === 'pending' ? `${e.borrowerName} would like to borrow it` : `Your request is now ${e.status}`);\nreturn [{ json: { eventId: $json.eventId, mail: {\n  From: { Email: 'notifications@lendloop.local', Name: 'LendLoop' },\n  To: [{ Email: e.recipientEmail, Name: e.recipientName }],\n  Subject: subjects[e.type] || 'LendLoop request update',\n  Text: `Hi ${e.recipientName}, ${statusLine}. Dates: ${e.startDate} to ${e.endDate}.`,\n} } }];"
+      },
+      "id": "prepare-request-email",
+      "name": "Prepare minimal notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mailpit:8025/api/v1/send",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.mail) }}",
+        "options": {}
+      },
+      "id": "send-request-mail",
+      "name": "Send notification to Mailpit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        30,
+        120
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "// The notification was sent: remember the event ID so a replay or retry is acknowledged without a second email.\nconst { eventId } = $('Verify signature and replay').first().json;\nconst store = $getWorkflowStaticData('global');\nstore.deliveredEventIds = store.deliveredEventIds || {};\nstore.deliveredEventIds[eventId] = Date.now();\nreturn [{ json: { eventId, delivered: true } }];"
+      },
+      "id": "remember-event",
+      "name": "Remember delivered event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst verified = $('Verify signature and replay').first().json;\nconst body = JSON.stringify({ ok: true, duplicate: verified.duplicate });\nconst signature = crypto.createHmac('sha256', $env.N8N_SHARED_SECRET)\n  .update(`${verified.timestamp}.200./webhook/lendloop-request-events.${body}`)\n  .digest('hex');\nreturn [{ json: { body, timestamp: verified.timestamp, signature } }];"
+      },
+      "id": "sign-request-ack",
+      "name": "Sign acknowledgement",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        490,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.body }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "content-type",
+                "value": "application/json"
+              },
+              {
+                "name": "x-lendloop-timestamp",
+                "value": "={{ $json.timestamp }}"
+              },
+              {
+                "name": "x-lendloop-signature",
+                "value": "={{ $json.signature }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "respond-request",
+      "name": "Acknowledge delivery",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        720,
+        20
+      ]
+    }
+  ],
+  "connections": {
+    "Request Event Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature and replay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature and replay": {
+      "main": [
+        [
+          {
+            "node": "Already delivered?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already delivered?": {
+      "main": [
+        [
+          {
+            "node": "Sign acknowledgement",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare minimal notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare minimal notification": {
+      "main": [
+        [
+          {
+            "node": "Send notification to Mailpit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send notification to Mailpit": {
+      "main": [
+        [
+          {
+            "node": "Remember delivered event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remember delivered event": {
+      "main": [
+        [
+          {
+            "node": "Sign acknowledgement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign acknowledgement": {
+      "main": [
+        [
+          {
+            "node": "Acknowledge delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "errorWorkflow": "LendLoopErrHndlr"
+  },
+  "versionId": "11111111-1111-4111-8111-111111111111",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

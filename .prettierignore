@@ -1,0 +1,4 @@
+.next
+node_modules
+convex/_generated
+n8n/*.json
